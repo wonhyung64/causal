@@ -2,8 +2,32 @@
 import random
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
 from tqdm import tqdm
 from numpy.random.mtrand import RandomState
+
+
+class MF(nn.Module):
+    """The neural collaborative filtering method.
+    """
+    def __init__(self, num_users, num_items, embedding_k):
+        super(MF, self).__init__()
+        self.num_users = num_users
+        self.num_items = num_items
+        self.embedding_k = embedding_k
+        self.user_embedding = nn.Embedding(self.num_users, self.embedding_k)
+        self.item_embedding = nn.Embedding(self.num_items, self.embedding_k)
+        torch.nn.init.normal_(self.user_embedding.weight, mean=0.0, std=0.1)
+        torch.nn.init.normal_(self.item_embedding.weight, mean=0.0, std=0.1)
+
+    def forward(self, x):
+        user_idx = x[:,0]
+        item_idx = x[:,1]
+        user_embed = self.user_embedding(user_idx)
+        item_embed = self.item_embedding(item_idx)
+
+        return user_embed, item_embed
 
 
 def func_sigmoid(x):
@@ -20,6 +44,16 @@ def print_result(result_list, top_k_list):
         print()
 
 
+def sample_excluding(A, B, n):
+    A_set = set(A)
+    B_set = set(B)
+    excluded_set = A_set - B_set
+    excluded_list = list(excluded_set)
+    sampled_values = np.random.choice(excluded_list, size=n, replace=True)
+    
+    return sampled_values
+
+
 #%% options
 rng = RandomState(seed=None)
 capping_T = 0.1
@@ -27,10 +61,18 @@ capping_C = 0.1
 with_IPS = True
 lr = 0.003
 embedding_k = 200
-coeff_T = 1.
-coeff_C = 1.
 num_epochs = 500
 top_k_list = [10, 100]
+batch_size = 512
+
+
+if torch.cuda.is_available():
+    device = "cuda"
+elif torch.backends.mps.is_available():
+    device = "mps"
+else: 
+    device = "cpu"
+
 
 # %% Category / Original
 data_dir = "/Users/wonhyung64/Github/causal/UnbiasedLearningCausal/data/preprocessed/dunn_cat_mailer_10_10_1_1/rank_rp0.40_sf2.00_nr210"
@@ -62,52 +104,59 @@ else:
 
 
 #%% Train
-user_factors = rng.normal(loc=0, scale=0.1, size=(num_users, embedding_k))
-item_factors = rng.normal(loc=0, scale=0.1, size=(num_items, embedding_k))
-
 df_train = df_train.sample(frac=1)
-users = df_train.loc[:, "idx_user"].values
-items = df_train.loc[:, "idx_item"].values
-ITE = df_train.loc[:, 'ITE'].values
+x_train = df_train.loc[:, ["idx_user", "idx_item"]].values
+y_train = df_train.loc[:, 'ITE'].values
 
-for epoch in tqdm(range(num_epochs)):
-    for n in np.arange(len(df_train)):
+num_sample = len(df_train)
+total_batch = num_sample // batch_size
 
-        u = users[n]
-        i = items[n]
+model = MF(num_users, num_items, embedding_k)
+model = model.to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-        while True:
-            j = random.randrange(num_items)
-            if i != j:
-                break
+all_items = np.arange(num_items)
 
-        u_factor = user_factors[u, :]
-        i_factor = item_factors[i, :]
-        j_factor = item_factors[j, :]
+for epoch in tqdm(range(1, num_epochs+1)):
+    all_idx = np.arange(num_sample)
+    np.random.shuffle(all_idx)
+    model.train()
 
-        diff_rating = np.sum(u_factor * (i_factor - j_factor))
+    for idx in range(total_batch):
 
-        if ITE[n] >= 0:
-            coeff = ITE[n] * coeff_T * func_sigmoid(-coeff_T * diff_rating) # Z=1, Y=1
-        else:
-            coeff = ITE[n] * coeff_C * func_sigmoid(coeff_C * diff_rating) # Z=0, Y=1
+        # mini-batch training
+        selected_idx = all_idx[batch_size*idx:(idx+1)*batch_size]
+        sub_x = x_train[selected_idx]
+        x_item_neg = sample_excluding(all_items, sub_x[:,1], batch_size)
+        sub_x_neg = np.array([sub_x[:,0], x_item_neg]).T
+        sub_x = torch.LongTensor(sub_x).to(device)
+        sub_x_neg = torch.LongTensor(sub_x_neg).to(device)
+        sub_y = y_train[selected_idx]
+        sub_y = torch.Tensor(sub_y).unsqueeze(-1).to(device)
 
-        user_factors[u, :] += \
-            lr * (coeff * (i_factor - j_factor))
-        item_factors[i, :] += \
-            lr * (coeff * u_factor)
-        item_factors[j, :] += \
-            lr * (-coeff * u_factor)
+        user_embed, item_embed = model(sub_x)
+        user_embed, neg_item_embed = model(sub_x)
+
+        diff_rating = nn.Sigmoid()((user_embed * (item_embed - neg_item_embed)).sum(-1)).unsqueeze(-1)
+        total_loss = (sub_y * diff_rating).mean()
+
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+
+
 
 #%%
 test_ate = test_df.groupby(["idx_user", "idx_item"])["causal_effect"].mean().reset_index()
 users = test_ate["idx_user"].values
 items = test_ate["idx_item"].values
 true = test_ate["causal_effect"].values
-pred = np.zeros(len(test_ate))
+x_test = test_ate[["idx_user", "idx_item"]].values
+x_test = torch.LongTensor(x_test).to(device)
 
-for n in np.arange(len(test_ate)):
-    pred[n] = np.inner(user_factors[users[n], :], item_factors[items[n], :])
+model.eval()
+user_embed, item_embed = model(x_test)
+pred = nn.Sigmoid()((user_embed * item_embed).sum(-1)).detach().cpu().numpy()
 
 user_dcg_list, user_precision_list, user_ar_list = [], [], []
 for u in tqdm(range(num_users)):

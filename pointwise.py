@@ -29,13 +29,6 @@ class MF(nn.Module):
         return out, user_embed, item_embed
 
 
-def func_sigmoid(x):
-    if x >= 0:
-        return 1.0 / (1.0 + np.exp(-x))
-    else:
-        return np.exp(x) / (1.0 + np.exp(x))
-
-
 def print_result(result_list, top_k_list):
     for k, top_k in enumerate(top_k_list):
         print(f"Top {top_k}")
@@ -43,20 +36,10 @@ def print_result(result_list, top_k_list):
         print()
 
 
-def sample_excluding(A, B, n):
-    A_set = set(A)
-    B_set = set(B)
-    excluded_set = A_set - B_set
-    excluded_list = list(excluded_set)
-    sampled_values = np.random.choice(excluded_list, size=n, replace=True)
-    
-    return sampled_values
-
-
 #%% options
 rng = RandomState(seed=None)
 lr = 0.01
-embedding_k = 16
+embedding_k = 200
 num_epochs = 500
 top_k_list = [10, 100]
 batch_size = 4096
